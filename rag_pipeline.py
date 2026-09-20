@@ -2,20 +2,13 @@ import os
 import json
 import math
 from typing import Optional
-from sentence_transformers import SentenceTransformer  # type: ignore[reportMissingImports]
-from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore[reportMissingImports]
-from openai import OpenAI
+import re
+from collections import Counter
+from http_helper import call_openai
 
 class CrossLingualRAG:
     def __init__(self, collection_name: str = "documents", embedding_model: str = "BAAI/bge-m3"):
-        self.embedding_model = SentenceTransformer(embedding_model)
         self.collection_name = collection_name
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", " ", ""]
-        )
         self.doc_counter = 0
 
         self.vectors = []
@@ -27,7 +20,7 @@ class CrossLingualRAG:
         chunk_ids = []
 
         for doc_idx, text in enumerate(texts):
-            doc_chunks = self.splitter.split_text(text)
+            doc_chunks = self.split_text(text, chunk_size=1000, chunk_overlap=200)
 
             for chunk_idx, chunk in enumerate(doc_chunks):
                 chunks.append(chunk)
@@ -43,14 +36,12 @@ class CrossLingualRAG:
                     meta.update(metadata_list[doc_idx])
                 chunk_metadata.append(meta)
 
-        embeddings = self.embedding_model.encode(chunks, convert_to_numpy=True)
-
-        for i, (chunk_id, chunk, embedding, meta) in enumerate(zip(chunk_ids, chunks, embeddings, chunk_metadata)):
+        for chunk_id, chunk, meta in zip(chunk_ids, chunks, chunk_metadata):
             self.vectors.append({
                 "chunk_id": chunk_id,
                 "content": chunk,
-                "embedding": embedding.tolist() if hasattr(embedding, "tolist") else list(embedding),
-                "metadata": meta
+                "embedding": self._embed(chunk),
+                "metadata": meta,
             })
 
         self.doc_counter += len(texts)
@@ -61,9 +52,7 @@ class CrossLingualRAG:
         if not self.vectors:
             return []
 
-        query_embedding = self.embedding_model.encode(query_text, convert_to_numpy=True)
-        if hasattr(query_embedding, "tolist"):
-            query_embedding = query_embedding.tolist()
+        query_embedding = self._embed(query_text)
 
         similarities = []
         for vector in self.vectors:
@@ -78,41 +67,63 @@ class CrossLingualRAG:
         similarities.sort(key=lambda x: x['distance'])
         return similarities[:n_results]
 
+    # @staticmethod
+    # def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    #     """Calculate cosine similarity between two vectors"""
+    #     norm1 = math.sqrt(sum(value * value for value in vec1))
+    #     norm2 = math.sqrt(sum(value * value for value in vec2))
+    #     if norm1 == 0 or norm2 == 0:
+    #         return 0.0
+    #     return sum(a * b for a, b in zip(vec1, vec2)) / (norm1 * norm2)
+
+    def rag_query(self, query_text: str, system_prompt: str = "You are a helpful assistant") -> str:
+        """Query vector store and generate response with OpenAI"""
+        retrieved = self.query(query_text, n_results=3)
+
+        context = "\n\n".join([f"[{r['metadata']['doc_name']}]\n{r['content']}" for r in retrieved])
+
+        return call_openai(query_text, context, system_prompt)
+
     @staticmethod
-    def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
-        """Calculate cosine similarity between two vectors"""
-        norm1 = math.sqrt(sum(value * value for value in vec1))
-        norm2 = math.sqrt(sum(value * value for value in vec2))
+    def _embed(text: str) -> dict[str, float]:
+        tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+        counts = Counter(tokens)
+        total = sum(counts.values()) or 1
+        return {token: count / total for token, count in counts.items()}
+
+    @staticmethod
+    def _cosine_similarity(
+        vec1: dict[str, float],
+        vec2: dict[str, float],
+    ) -> float:
+        dot_product = sum(vec1.get(key, 0) * value for key, value in vec2.items())
+        norm1 = math.sqrt(sum(value * value for value in vec1.values()))
+        norm2 = math.sqrt(sum(value * value for value in vec2.values()))
+
         if norm1 == 0 or norm2 == 0:
             return 0.0
-        return sum(a * b for a, b in zip(vec1, vec2)) / (norm1 * norm2)
 
-    def rag_query(self, query_text: str, system_prompt: str = "You are a helpful assistant") -> str:
-        """Query vector store and generate response with OpenAI"""
-        retrieved = self.query(query_text, n_results=3)
+        return dot_product / (norm1 * norm2)
 
-        context = "\n\n".join([f"[{r['metadata']['doc_name']}]\n{r['content']}" for r in retrieved])
+    def split_text(self, text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> list[str]:
+        chunks = []
+        start = 0
+        text_length = len(text)
+        step = chunk_size - chunk_overlap
 
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query_text}"}
-            ]
-        )
-        return response.choices[0].message.content
+        if step <= 0:
+            raise ValueError("chunk_size must be greater than chunk_overlap")
 
-    def rag_query(self, query_text: str, system_prompt: str = "You are a helpful assistant") -> str:
-        """Query vector store and generate response with OpenAI"""
-        retrieved = self.query(query_text, n_results=3)
+        while start < text_length:
+            end = min(start + chunk_size, text_length)
+            chunk = text[start:end].strip()
 
-        context = "\n\n".join([f"[{r['metadata']['doc_name']}]\n{r['content']}" for r in retrieved])
+            if chunk:
+                chunks.append(chunk)
 
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query_text}"}
-            ]
-        )
-        return response.choices[0].message.content
+            if end == text_length:
+                break
+
+            start += step
+
+        return chunks
