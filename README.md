@@ -104,6 +104,6 @@ tools = [
 ├── rag_pipeline.py       # Main RAG class
 ├── example_usage.py      # Usage examples
 ├── requirements.txt      # Dependencies
-├── .env.example          # Environment template
+├── .env          # Environment template
 └── README.md             # This file
 ```
