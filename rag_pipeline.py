@@ -67,15 +67,6 @@ class CrossLingualRAG:
         similarities.sort(key=lambda x: x['distance'])
         return similarities[:n_results]
 
-    # @staticmethod
-    # def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
-    #     """Calculate cosine similarity between two vectors"""
-    #     norm1 = math.sqrt(sum(value * value for value in vec1))
-    #     norm2 = math.sqrt(sum(value * value for value in vec2))
-    #     if norm1 == 0 or norm2 == 0:
-    #         return 0.0
-    #     return sum(a * b for a, b in zip(vec1, vec2)) / (norm1 * norm2)
-
     def rag_query(self, query_text: str, system_prompt: str = "You are a helpful assistant") -> str:
         """Query vector store and generate response with OpenAI"""
         retrieved = self.query(query_text, n_results=3)
@@ -83,13 +74,6 @@ class CrossLingualRAG:
         context = "\n\n".join([f"[{r['metadata']['doc_name']}]\n{r['content']}" for r in retrieved])
 
         return call_openai(query_text, context, system_prompt)
-
-    @staticmethod
-    def _embed(text: str) -> dict[str, float]:
-        tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
-        counts = Counter(tokens)
-        total = sum(counts.values()) or 1
-        return {token: count / total for token, count in counts.items()}
 
     @staticmethod
     def _cosine_similarity(
@@ -104,6 +88,13 @@ class CrossLingualRAG:
             return 0.0
 
         return dot_product / (norm1 * norm2)
+
+    @staticmethod
+    def _embed(text: str) -> dict[str, float]:
+        tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+        counts = Counter(tokens)
+        total = sum(counts.values()) or 1
+        return {token: count / total for token, count in counts.items()}
 
     def split_text(self, text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> list[str]:
         chunks = []

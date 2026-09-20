@@ -53,7 +53,7 @@ print(f"Query: {eng_query}")
 response = rag.rag_query(eng_query)
 print(response)
 
-print("\n--- Cross-lingual Query ---")
+print("\n--- Cross-lingual Query (TH + EN) ---")
 mixed_query = "Vector database และการค้นหา semantic search"
 print(f"Query: {mixed_query}")
 response = rag.rag_query(mixed_query)

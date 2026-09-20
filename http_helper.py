@@ -1,8 +1,8 @@
 import json
 import os
 import urllib.request
-
-
+import urllib.error
+import time
 
 def call_openai(query: str, context: str, system_prompt: str) -> str:
     payload = json.dumps({
