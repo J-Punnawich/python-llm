@@ -6,7 +6,6 @@ A Python RAG system with BGE-M3 embeddings, Chroma vector DB, and OpenAI LLM int
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
 # Add your OPENAI_API_KEY to .env
 ```
 
