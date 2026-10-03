@@ -1,71 +1,106 @@
 import os
-import json
-import math
+import hashlib
+from datetime import datetime, timezone
 from typing import Optional
-import re
-from collections import Counter
-from http_helper import call_openai
+import truststore
+# Use the Windows OS certificate store (trusts the corporate proxy's root CA)
+# for all SSL connections instead of the certifi bundle.
+truststore.inject_into_ssl()
+from astrapy import DataAPIClient
+from astrapy.info import CollectionDefinition
+from http_helper import call_openai, get_embedding, EMBEDDING_MODEL, EMBEDDING_DIM
 
 class CrossLingualRAG:
-    def __init__(self, collection_name: str = "documents", embedding_model: str = "BAAI/bge-m3"):
-        self.collection_name = collection_name
-        self.doc_counter = 0
+    def __init__(self, collection_name: str = "documents", embedding_model: str = EMBEDDING_MODEL):
+        self.embedding_model = embedding_model
 
-        self.vectors = []
+        client = DataAPIClient(os.environ["ASTRA_DB_APPLICATION_TOKEN"])
+        database = client.get_database(os.environ["ASTRA_DB_API_ENDPOINT"])
+
+        chunks_definition = (
+            CollectionDefinition.builder()
+            .with_vector_dimension(EMBEDDING_DIM)
+            .with_vector_metric("cosine")
+            .build()
+        )
+        self.chunks = database.create_collection(collection_name, definition=chunks_definition)
+        # Tracks which documents were ingested, independent of per-chunk vector rows
+        self.registry = database.create_collection(f"{collection_name}_registry")
 
     def add_documents(self, texts: list[str], metadata_list: Optional[list[dict]] = None):
-        """Add documents to in-memory store with chunking"""
-        chunks = []
-        chunk_metadata = []
-        chunk_ids = []
+        chunk_records = []
+        total_new_chunks = 0
 
         for doc_idx, text in enumerate(texts):
+            doc_name = metadata_list[doc_idx].get("name", f"doc_{doc_idx}") if metadata_list else f"doc_{doc_idx}"
+            source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            doc_id = source_hash[:16]
+
+            if self.registry.find_one({"_id": doc_id}):
+                print(f"Skipping '{doc_name}' (already ingested, hash unchanged)")
+                continue
+
             doc_chunks = self.split_text(text, chunk_size=1000, chunk_overlap=200)
 
+            meta = dict(metadata_list[doc_idx]) if metadata_list and metadata_list[doc_idx] else {}
+            meta["doc_name"] = doc_name
+
             for chunk_idx, chunk in enumerate(doc_chunks):
-                chunks.append(chunk)
-                chunk_id = f"chunk_{self.doc_counter}_{len(chunks)-1}"
-                chunk_ids.append(chunk_id)
+                chunk_records.append({
+                    "_id": f"{doc_id}_{chunk_idx}",
+                    "content": chunk,
+                    "$vector": get_embedding(chunk),
+                    "doc_id": doc_id,
+                    "chunk_index": chunk_idx,
+                    "metadata": meta,
+                })
 
-                meta = {
-                    "doc_id": str(doc_idx),
-                    "chunk_id": str(chunk_idx),
-                    "doc_name": metadata_list[doc_idx].get("name", f"doc_{doc_idx}") if metadata_list else f"doc_{doc_idx}",
-                }
-                if metadata_list and metadata_list[doc_idx]:
-                    meta.update(metadata_list[doc_idx])
-                chunk_metadata.append(meta)
-
-        for chunk_id, chunk, meta in zip(chunk_ids, chunks, chunk_metadata):
-            self.vectors.append({
-                "chunk_id": chunk_id,
-                "content": chunk,
-                "embedding": self._embed(chunk),
+            self.registry.insert_one({
+                "_id": doc_id,
+                "doc_name": doc_name,
+                "source_hash": source_hash,
+                "chunk_count": len(doc_chunks),
+                "chunk_size": 1000,
+                "chunk_overlap": 200,
+                "embedding_model": self.embedding_model,
+                "embedding_dim": EMBEDDING_DIM,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": meta,
             })
+            total_new_chunks += len(doc_chunks)
 
-        self.doc_counter += len(texts)
-        print(f"Added {len(chunks)} chunks from {len(texts)} documents")
+        if chunk_records:
+            self.chunks.insert_many(chunk_records)
+
+        print(f"Added {total_new_chunks} chunks from {len(texts)} documents")
+
+    def list_documents(self) -> list[dict]:
+        """Return the ingestion registry, to track back what was added and how"""
+        return list(self.registry.find({}))
+
+    def delete_document(self, doc_id: str):
+        self.chunks.delete_many({"doc_id": doc_id})
+        self.registry.delete_one({"_id": doc_id})
 
     def query(self, query_text: str, n_results: int = 3) -> list[dict]:
-        """Query in-memory vectors using cosine similarity search"""
-        if not self.vectors:
-            return []
+        """Query Astra DB vector collection using ANN similarity search"""
+        query_embedding = get_embedding(query_text)
 
-        query_embedding = self._embed(query_text)
+        results = self.chunks.find(
+            {},
+            sort={"$vector": query_embedding},
+            limit=n_results,
+            include_similarity=True,
+        )
 
-        similarities = []
-        for vector in self.vectors:
-            stored_embedding = vector['embedding']
-            similarity = self._cosine_similarity(query_embedding, stored_embedding)
-            similarities.append({
-                "content": vector['content'],
-                "metadata": vector['metadata'],
-                "distance": 1 - similarity
-            })
-
-        similarities.sort(key=lambda x: x['distance'])
-        return similarities[:n_results]
+        return [
+            {
+                "content": r["content"],
+                "metadata": r["metadata"],
+                "distance": 1 - r.get("$similarity", 0),
+            }
+            for r in results
+        ]
 
     def rag_query(self, query_text: str, system_prompt: str = "You are a helpful assistant") -> str:
         """Query vector store and generate response with OpenAI"""
@@ -74,27 +109,6 @@ class CrossLingualRAG:
         context = "\n\n".join([f"[{r['metadata']['doc_name']}]\n{r['content']}" for r in retrieved])
 
         return call_openai(query_text, context, system_prompt)
-
-    @staticmethod
-    def _cosine_similarity(
-        vec1: dict[str, float],
-        vec2: dict[str, float],
-    ) -> float:
-        dot_product = sum(vec1.get(key, 0) * value for key, value in vec2.items())
-        norm1 = math.sqrt(sum(value * value for value in vec1.values()))
-        norm2 = math.sqrt(sum(value * value for value in vec2.values()))
-
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-
-        return dot_product / (norm1 * norm2)
-
-    @staticmethod
-    def _embed(text: str) -> dict[str, float]:
-        tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
-        counts = Counter(tokens)
-        total = sum(counts.values()) or 1
-        return {token: count / total for token, count in counts.items()}
 
     def split_text(self, text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> list[str]:
         chunks = []
